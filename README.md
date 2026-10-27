@@ -131,7 +131,7 @@ apt update && apt install -y \
 | User / database | `librenms` / `librenms` |
 | Password | `********` |
 
-**Global setting: `uptime_warning`.** LibreNMS flags a device as *warning* when its uptime is below this threshold (seconds). Homelab devices reboot often, so the value is lowered to keep freshly rebooted devices green in the availability map.
+**Global setting: `uptime_warning`.** LibreNMS flags a device as *warning* when its uptime is below this threshold (default `86400` s, 24 h). Homelab devices reboot often, so the value is lowered to `300` s to keep freshly rebooted devices green in the availability map. Set it in `Global Settings` (gear icon) → `Web UI` → `Device Settings` → *Show Device as warning if Uptime below (seconds)*.
 
 ![uptime_warning setting](./images/uptime-warning.png)
 
@@ -181,15 +181,15 @@ snmpwalk -v2c -c <COMMUNITY> 192.168.10.105 sysDescr
 
 ## 5. Adding network devices
 
-> **Why:** every device needs SNMP enabled, the same read-only community, and permission for `192.168.10.111` to query it. Display names keep dashboards and alerts readable.
+> **Why:** every device needs SNMP enabled, a read-only community that matches the one stored for it in LibreNMS (communities are case-sensitive), and permission for `192.168.10.111` to query it. Display names keep dashboards and alerts readable.
 
 **5.1 Enable SNMP v2c on each device**
 
 | Device | Where | What to set |
 |---|---|---|
 | FortiGate 40F | `Network → Interfaces` | On the interface LibreNMS reaches (`lan`), tick **SNMP** under Administrative Access |
-| | `System → SNMP` | Enable the agent, create a v1/v2c community, allow host `192.168.10.111` |
-| Cisco SG300 | `SNMP → Communities` | Add a community: access mode *Read Only*, management station `192.168.10.111` |
+| | `System → SNMP` | Enable the agent, create a v1/v2c community with v2c queries enabled and v1 disabled, allow host `192.168.10.111/32` |
+| Cisco SG300 | `SNMP → Communities` | Add a community: type *Basic*, access mode *Read Only*, management station `192.168.10.111` |
 | Wireless AP | SNMP settings page | Enable SNMP and set the read-only community |
 
 ![FortiGate interface with SNMP access](./images/fortigate-interface-snmp.png)
@@ -379,16 +379,16 @@ Result in Telegram:
 
 ![Minimalist alert in Telegram](./images/telegram-minimal.png)
 
-**7.6 End-to-end test: unplug an LACP member link.** To validate the whole chain (polling, rule, operation, transport and template), one member link of the FortiGate–SG300 LACP bundle was unplugged on purpose and then plugged back in. The two ends of that link are FortiGate `lan2` and Cisco `gigabitethernet9`.
+**7.6 End-to-end test: unplug an LACP member link.** To validate the whole chain (polling, rule, operation, transport and template), one member link of the FortiGate–SG300 LACP bundle was unplugged on purpose and then plugged back in. The two ends of that link are FortiGate `lan2` and Cisco `gigabitethernet9`. The test was run twice: the Faults page capture comes from the first run (13:05), and the Telegram captures from the second run, after the final template was applied.
 
 | Step | Observed |
 |---|---|
-| Link unplugged | `Port status up/down` raised on both devices: `Fortigate 40f` / `lan2` at 13:05:06 and `Switch Cisco` / `gigabitethernet9` at 13:05:09 |
+| Link unplugged | `Port status up/down` raised on both devices: `Fortigate 40f` / `lan2` at 21:20:06 and `Switch Cisco` / `gigabitethernet9` at 21:20:08 |
 | LibreNMS | Both faults listed on the Faults page |
-| Telegram | One `ALERT` message per device, each naming the port |
-| Link restored | One `RESOLVED` message per device at 13:10:06 and 13:10:08, with alert durations of 5m and 4m 59s |
+| Telegram | One `ALERT` message per device, each naming the port as `down` |
+| Link restored | One `RESOLVED` message per device at 21:25:06 and 21:25:09, with alert durations of 5m and 5m 1s, each naming the port as `up` |
 
-![Faults page during the test](./images/lacp-test-faults.png)
+![Faults page during the first run](./images/lacp-test-faults.png)
 ![ALERT messages in Telegram](./images/lacp-test-alert.png)
 ![RESOLVED messages in Telegram](./images/lacp-test-resolved.png)
 
