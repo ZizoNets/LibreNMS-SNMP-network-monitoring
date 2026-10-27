@@ -402,7 +402,10 @@ I wanted one page that shows everything at a glance. On the Overview page, use t
 | Top Interfaces | the busiest interfaces in the last 15 minutes |
 | Device Summary Horizontal | totals of devices, ports and sensors |
 
-![Dashboard summary widgets](./images/dashboard-summary.png)
+<img width="1900" height="944" alt="image" src="https://github.com/user-attachments/assets/5f75a8d3-2250-4677-aa62-b4595df1bf1b" />
+<img width="1891" height="328" alt="image" src="https://github.com/user-attachments/assets/7dafd9eb-9831-4788-8cc9-55d44e19deed" />
+
+
 
 Two more pages are useful to check that data is coming in: `Health → Processor` for CPU on every device, and the overview page of each device.
 
@@ -415,5 +418,5 @@ Two more pages are useful to check that data is coming in: `Health → Processor
 
 - Use read-only communities and limit them to the LibreNMS IP (the IP at the end of `rocommunity`, and the allowed host on the FortiGate and the SG300).
 - Don't leave the default strings (`public`, `private`). My access point also has a read-write community field: leave it empty or change it.
-- SNMP v2c sends the community in clear text, as the capture in step 4 shows. Keep UDP 161 inside your LAN. SNMPv3 is the safer option if you can use it.
+- SNMP v2c sends the community in clear text, as the capture in step 4 shows. Keep UDP 161 inside your LAN. SNMPv3 is the safer option if you can use it, although it uses more resources on the device.
 - Hide communities, bot tokens and chat IDs before you share screenshots.
