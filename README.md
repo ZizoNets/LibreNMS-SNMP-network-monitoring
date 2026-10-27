@@ -17,16 +17,8 @@ LibreNMS runs in an LXC container on a Proxmox mini PC. It polls four devices on
 
 LibreNMS itself is at `192.168.10.111`.
 
-```mermaid
-flowchart TB
-    NET([Internet]) -->|"WAN 1 Gbps"| FGT["FortiGate 40F<br/>192.168.10.1"]
-    FGT ==>|"LACP Po1 · 2 Gbps"| SW["Cisco SG300-10PP<br/>192.168.10.8"]
-    SW --- AP["Wireless AP<br/>192.168.10.108"]
-    subgraph PVE["Proxmox VE host · 192.168.10.105 · snmpd"]
-        NMS["LibreNMS (LXC 102)<br/>192.168.10.111"]
-    end
-    SW --- PVE
-```
+<img width="926" height="602" alt="image" src="https://github.com/user-attachments/assets/14499884-7426-407a-a37e-11512fd8e51b" />
+
 
 Everything is on the same LAN, so LibreNMS talks to each device directly on UDP port 161.
 
