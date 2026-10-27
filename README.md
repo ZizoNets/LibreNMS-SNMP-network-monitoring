@@ -1,52 +1,21 @@
-# Homelab Network Monitoring with LibreNMS
+# Monitoring a home network with LibreNMS
 
-SNMP v2c monitoring for a small homelab: firewall, managed switch, hypervisor and wireless AP, polled by [LibreNMS](https://www.librenms.org/) and reported through minimalist Telegram alerts.
+These are my notes on setting up [LibreNMS](https://www.librenms.org/) to monitor my home network over SNMP and send alerts to Telegram. I wrote them as a step-by-step guide, so you can follow along and do the same on your own network.
 
-![Homelab NOC dashboard](./images/dashboard.png)
+![Dashboard](./images/dashboard.png)
 
-| | |
-|---|---|
-| **Server** | LibreNMS in an LXC container on Proxmox VE (`192.168.10.111`) |
-| **Protocol** | SNMP v2c, read-only, UDP/161 |
-| **Devices** | 4 (firewall, switch, hypervisor, wireless AP) |
-| **Alerting** | Telegram bot, HTML template, one reusable alert operation |
-| **Outcome** | 4/4 devices up, 69 ports (14 ignored), 82 sensors, no active alerts |
-| **Tested** | SNMP polling captured on the wire; one LACP member link unplugged and restored with `ALERT` and `RESOLVED` received in Telegram |
+## What I'm monitoring
 
-## Contents
+LibreNMS runs in an LXC container on a Proxmox mini PC. It polls four devices on the same network (`192.168.10.0/24`) using SNMP v2c:
 
-1. [Overview](#1-overview)
-2. [Architecture](#2-architecture)
-3. [LibreNMS installation and initial setup](#3-librenms-installation-and-initial-setup)
-4. [Proxmox host SNMP agent](#4-proxmox-host-snmp-agent)
-5. [Adding network devices](#5-adding-network-devices)
-6. [Noise reduction](#6-noise-reduction)
-7. [Telegram alerting](#7-telegram-alerting)
-8. [Dashboard](#8-dashboard)
-9. [Result](#9-result)
-10. [Testing and troubleshooting](#10-testing-and-troubleshooting)
-11. [Security notes](#11-security-notes)
-
-**Prerequisites:** a Proxmox VE host with room for one LXC (2 vCPU, 4 GB RAM, 64 GB disk), devices reachable on `192.168.10.0/24` with SNMP v2c available, and a Telegram account.
-
----
-
-## 1. Overview
-
-| LibreNMS display name | Device | IP | Notes |
+| Name in LibreNMS | Device | IP | Notes |
 |---|---|---|---|
-| `Fortigate 40f` | FortiGate 40F, FortiOS 7.2.11 | `192.168.10.1` | Firewall. WAN (1 Gbps) and LAN LACP trunk (2 Gbps) |
-| `Switch Cisco` | Cisco SG300-10PP | `192.168.10.8` | 10-port Gigabit PoE+. LACP (`Po1`) uplink to the FortiGate |
-| `Proxmox SNMP Agent (Mini PC)` | Proxmox VE host, kernel 6.17.2-1-pve | `192.168.10.105` | Hosts the LibreNMS LXC. SNMP through `snmpd` |
-| `Netgear AP` | WAX214 wireless AP | `192.168.10.108` | Detected by LibreNMS as *EnGenius Access Point* (router mode) |
+| `Fortigate 40f` | FortiGate 40F, FortiOS 7.2.11 | `192.168.10.1` | Firewall. WAN (1 Gbps) and a 2 Gbps LACP link to the switch |
+| `Switch Cisco` | Cisco SG300-10PP | `192.168.10.8` | 10-port PoE+ switch. The LACP group is `Po1` |
+| `Proxmox SNMP Agent (Mini PC)` | Proxmox VE host | `192.168.10.105` | Runs LibreNMS. SNMP comes from `snmpd` |
+| `Netgear AP` | WAX214 access point | `192.168.10.108` | LibreNMS detects it as an EnGenius access point |
 
-LibreNMS itself runs at `192.168.10.111`.
-
-![Devices list](./images/devices-list.png)
-
-## 2. Architecture
-
-All devices share the `192.168.10.0/24` LAN. LibreNMS polls each one over SNMP v2c and stores the results locally.
+LibreNMS itself is at `192.168.10.111`.
 
 ```mermaid
 flowchart TB
@@ -59,20 +28,28 @@ flowchart TB
     SW --- PVE
 ```
 
-Alert path inside LibreNMS ([official model](https://docs.librenms.org/Alerting/)): a rule raises the alert, an operation decides who is notified and when, a transport delivers it and a template formats the message.
+Everything is on the same LAN, so LibreNMS talks to each device directly on UDP port 161.
 
-```mermaid
-flowchart LR
-    R["Alert rule<br/>trigger"] --> O["Alert operation<br/>who and when"] --> T["Alert transport<br/>delivery"] --> TPL["Alert template<br/>message format"] --> TG(["Telegram chat"])
-```
+**What you need:** a Proxmox host (or any Linux machine or VM) to run LibreNMS, devices that support SNMP, and a Telegram account for the alerts.
+
+The steps:
+
+1. Install LibreNMS
+2. Set up SNMP on the Proxmox host
+3. Enable SNMP on the other devices and add them
+4. Optional: look at the SNMP traffic
+5. Cut the noise
+6. Set up Telegram alerts
+7. Test the alerts
+8. Build a dashboard
 
 ---
 
-## 3. LibreNMS installation and initial setup
+## 1. Install LibreNMS
 
-> **Why an LXC:** the monitoring server stays isolated from the hypervisor, can be snapshotted or restored on its own, and has a fixed IP that devices can whitelist.
+I run LibreNMS in its own LXC container. That keeps it separate from the Proxmox host, I can snapshot it before an upgrade, and it has a fixed IP address.
 
-**Container (Proxmox VE)**
+This is what I gave the container:
 
 | Setting | Value |
 |---|---|
@@ -82,9 +59,9 @@ flowchart LR
 | Root disk | 64 GB (`local-lvm`) |
 | Address | `192.168.10.111/24`, gateway `192.168.10.1` |
 
-![Proxmox LXC resources](./images/proxmox-lxc-resources.png)
+![LXC resources in Proxmox](./images/proxmox-lxc-resources.png)
 
-Check addressing, routing and Internet access before installing anything:
+Before installing anything, check that the container has an address, a default route and Internet access:
 
 ```bash
 ip address
@@ -92,9 +69,9 @@ ip route
 ping 1.1.1.1
 ```
 
-![LXC network check](./images/lxc-network-check.png)
+![Network check inside the container](./images/lxc-network-check.png)
 
-**Dependencies**
+Install the dependencies:
 
 ```bash
 apt update && apt install -y \
@@ -107,11 +84,11 @@ apt update && apt install -y \
   rrdtool snmp snmpd unzip whois
 ```
 
-**Installation.** Follow the [official installation guide](https://docs.librenms.org/Installation/Install-LibreNMS/). In short:
+The rest of the installation follows the [official guide](https://docs.librenms.org/Installation/Install-LibreNMS/), so I won't copy every command here. These are the steps and what each one is for:
 
-1. Create the `librenms` system user, clone the repository to `/opt/librenms` and set ownership and ACLs.
-2. Install PHP dependencies as `librenms` with `./scripts/composer_wrapper.php install --no-dev`.
-3. Create the database and enable the required MariaDB options (`innodb_file_per_table=1`, `lower_case_table_names=0`):
+1. Create a `librenms` user and clone the repository into `/opt/librenms`. LibreNMS should not run as root.
+2. Install the PHP dependencies as that user with `./scripts/composer_wrapper.php install --no-dev`.
+3. Create the database. LibreNMS needs two MariaDB options (`innodb_file_per_table=1` and `lower_case_table_names=0`), then:
 
    ```sql
    CREATE DATABASE librenms CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -120,230 +97,223 @@ apt update && apt install -y \
    FLUSH PRIVILEGES;
    ```
 
-4. Set the PHP timezone, create the `librenms` php-fpm pool and the nginx server block, then install the cron and logrotate files.
-5. Open `http://192.168.10.111/install` and complete the web installer.
+4. Set the PHP timezone and configure php-fpm and nginx so the web interface works.
+5. Install the cron and logrotate files. The cron job is what runs the polling.
+6. Open `http://192.168.10.111/install` and go through the web installer.
 
-![Web installer, database step](./images/librenms-installer-database.png)
+On the database page of the installer, use the values from step 3:
 
-| Installer field | Value |
+![Web installer, database page](./images/librenms-installer-database.png)
+
+| Field | Value |
 |---|---|
 | Host / port | `localhost` / `3306` |
 | User / database | `librenms` / `librenms` |
-| Password | `********` |
+| Password | the one you chose |
 
-**Global setting: `uptime_warning`.** LibreNMS flags a device as *warning* when its uptime is below this threshold (default `86400` s, 24 h). Homelab devices reboot often, so the value is lowered to `300` s to keep freshly rebooted devices green in the availability map. Set it in `Global Settings` (gear icon) → `Web UI` → `Device Settings` → *Show Device as warning if Uptime below (seconds)*.
+**One setting I changed.** LibreNMS shows a device as *warning* if its uptime is below a threshold. By default that is 24 hours (`86400` s), so after any reboot the device stays yellow for a day. I set it to `300` s. You find it under the gear icon → `Global Settings` → `Web UI` → `Device Settings`, in *Show Device as warning if Uptime below (seconds)*.
 
 ![uptime_warning setting](./images/uptime-warning.png)
 
 ---
 
-## 4. Proxmox host SNMP agent
+## 2. Set up SNMP on the Proxmox host
 
-> **Why:** LibreNMS can only poll what an agent serves. Proxmox VE has no SNMP agent enabled by default, so the host runs `snmpd` (Debian base). A source-restricted, read-only community limits exposure.
+LibreNMS can only read what an SNMP agent answers, and Proxmox doesn't come with one set up. I installed `snmpd` on the host:
 
 ```bash
 apt install snmpd
 ```
 
-Edit `/etc/snmp/snmpd.conf`:
+Then edit `/etc/snmp/snmpd.conf`:
 
 ```conf
-# Listen on all interfaces, UDP/161 (the stock config binds to loopback only)
+# Listen on all interfaces, UDP 161 (the default only listens on localhost)
 agentaddress udp:161
 
 # Read-only community, answered only to the LibreNMS server
 rocommunity <COMMUNITY> 192.168.10.111
 
-# Shown in the LibreNMS device overview
+# Shown in the device overview in LibreNMS
 sysLocation Homelab
 sysContact  admin@example.com
-
-# Comment out the stock "rocommunity public ..." and "rocommunity6 public ..." lines
 ```
 
-Restart and enable the service:
+- `agentaddress` makes `snmpd` listen on the network. Without it LibreNMS can't reach it.
+- `rocommunity` is the password for read-only access. The IP at the end limits it to the LibreNMS server, so nobody else on the LAN can use it.
+- Comment out the default `rocommunity public ...` lines that come with the package.
+
+![snmpd agentaddress](./images/snmpd-agentaddress.png)
+
+Restart `snmpd` and make it start on boot:
 
 ```bash
 systemctl restart snmpd
 systemctl enable snmpd
 ```
 
-Verify from the LibreNMS LXC:
+![Active snmpd.conf lines and service status](./images/snmpd-conf.png)
+
+To check it works, run this from the LibreNMS container. You should get the system description back:
 
 ```bash
 snmpwalk -v2c -c <COMMUNITY> 192.168.10.105 sysDescr
 ```
 
-![snmpd agentaddress](./images/snmpd-agentaddress.png)
-![snmpd.conf and service restart](./images/snmpd-conf.png)
-
 ---
 
-## 5. Adding network devices
+## 3. Enable SNMP on the other devices and add them
 
-> **Why:** every device needs SNMP enabled, a read-only community that matches the one stored for it in LibreNMS (communities are case-sensitive), and permission for `192.168.10.111` to query it. Display names keep dashboards and alerts readable.
-
-**5.1 Enable SNMP v2c on each device**
+Each device needs three things: SNMP turned on, a read-only community, and permission for `192.168.10.111` to query it. SNMP communities are case-sensitive, so the string you enter in LibreNMS has to match exactly what you set on the device.
 
 | Device | Where | What to set |
 |---|---|---|
 | FortiGate 40F | `Network → Interfaces` | On the interface LibreNMS reaches (`lan`), tick **SNMP** under Administrative Access |
-| | `System → SNMP` | Enable the agent, create a v1/v2c community with v2c queries enabled and v1 disabled, allow host `192.168.10.111/32` |
+| | `System → SNMP` | Enable the SNMP agent and create a v1/v2c community. I enabled v2c queries and disabled v1, and allowed host `192.168.10.111/32` |
 | Cisco SG300 | `SNMP → Communities` | Add a community: type *Basic*, access mode *Read Only*, management station `192.168.10.111` |
 | Wireless AP | SNMP settings page | Enable SNMP and set the read-only community |
 
 ![FortiGate interface with SNMP access](./images/fortigate-interface-snmp.png)
 ![FortiGate SNMP community](./images/fortigate-snmp-community.png)
-![Cisco SG300 SNMP community](./images/sg300-snmp.png)
-![Wireless AP SNMP settings](./images/ap-snmp-settings.png)
+![Cisco SG300 communities](./images/sg300-snmp.png)
+![Access point SNMP settings](./images/ap-snmp-settings.png)
 
-**5.2 Add the devices in LibreNMS**
-
-`Devices → Add Device`, once per device:
+Now add the devices in LibreNMS with `Devices → Add Device`, once per device:
 
 | Field | Value |
 |---|---|
-| Hostname or IP | device IP |
+| Hostname or IP | the device IP |
 | SNMP | ON |
 | SNMP Version | `v2c` |
-| Transport | `udp` (default port) |
-| Community | `********` |
+| Transport | `udp` (leave the port empty) |
+| Community | the one you set on that device |
 
 ![Add Device form](./images/add-device.png)
 
-CLI alternative: `lnms device:add <hostname or ip>` (see `lnms device:add --help` for the SNMP options).
+You can also do it from the command line with `lnms device:add <hostname or ip>` (see `lnms device:add --help` for the SNMP options).
 
-**5.3 Set display names**
+After adding each one, open `Device → Edit` and set a **Display Name**. That name is what you will see in the dashboard and in the alerts, instead of an IP.
 
-`Device → Edit → Display Name`. The names appear in dashboards and alert messages instead of raw IPs. The final list is shown in [Overview](#1-overview).
-
-**5.4 Verify SNMP on the wire (optional).** A packet capture confirms that LibreNMS polls each device and shows what the traffic looks like. The SG300 mirrors one port to a laptop running Wireshark (`Port and VLAN Mirroring`):
-
-| Field | Value |
-|---|---|
-| Destination port | `GE4` (laptop with Wireshark) |
-| Source interface | Port `GE3` (mini PC running Proxmox VE, the LibreNMS LXC and the other services) |
-| Type | Tx and Rx |
-
-![Port mirroring on the SG300](./images/snmp-capture-mirror.png)
-
-Capture with the display filter `snmp`:
-
-![SNMP polling in Wireshark](./images/snmp-capture-overview.png)
-
-What the capture shows:
-
-- `192.168.10.111` sends `get-request` packets to `192.168.10.1`, `192.168.10.8` and `192.168.10.108`, and each one receives a `get-response`.
-- The traffic is SNMP v2c to UDP port 161.
-- 7006 packets captured, 626 shown by the `snmp` filter, 0 lost.
-- Example: request 6216 to the FortiGate is answered by packet 6217 with `error-status: noError` and `sysObjectID` (`1.3.6.1.2.1.1.2.0`) = `1.3.6.1.4.1.12356.101.1.441`, which sits under Fortinet's enterprise branch.
-- Polling of the Proxmox host (`192.168.10.105`) is not expected on the mirrored port, because LibreNMS runs on that same host.
-
-![SNMP get-request to the FortiGate](./images/snmp-capture-request.png)
-![SNMP get-response from the FortiGate](./images/snmp-capture-response.png)
-
-The community string travels in clear text and is readable by anyone who can capture the traffic. It is masked in these screenshots. See [Security notes](#11-security-notes).
+![Device list](./images/devices-list.png)
 
 ---
 
-## 6. Noise reduction
+## 4. Optional: look at the SNMP traffic
 
-> **Why:** an alert that is always on gets ignored. Anything that is down by design must not page you.
+I wanted to see what the polling looks like on the wire, so I mirrored a switch port and captured it with Wireshark. You don't need this for the setup.
 
-**6.1 Unused ports.** The *Port status up/down* rule fires for every port in `down` state. Ports without a cable and unrouted SVIs are marked **IGNORE** in `Device → Edit → Ports`. Polling continues, alerts stop.
+On the SG300 I used `Port and VLAN Mirroring` to copy the traffic of `GE3` (the port of the mini PC that runs Proxmox, LibreNMS and my other services) to `GE4`, where my laptop was connected. I mirrored both directions (Tx and Rx).
+
+![Port mirroring on the SG300](./images/snmp-capture-mirror.png)
+
+In Wireshark, filter by `snmp`. You see LibreNMS (`192.168.10.111`) sending `get-request` packets to the other devices and each one answering with a `get-response`.
+
+![SNMP polling in Wireshark](./images/snmp-capture-overview.png)
+
+Opening one request and its answer, both to the FortiGate (packets 6216 and 6217): it's SNMP v2c on UDP port 161, the answer has `error-status: noError`, and the community is in the packet in clear text (I blurred it).
+
+![SNMP request](./images/snmp-capture-request.png)
+![SNMP response](./images/snmp-capture-response.png)
+
+You won't see the Proxmox host (`192.168.10.105`) in this capture. LibreNMS runs on that same host, so that traffic never leaves it.
+
+---
+
+## 5. Cut the noise
+
+Out of the box, LibreNMS alerts about anything that is down, including things that are down on purpose. If you leave that alone you end up ignoring the alerts. I did two things.
+
+**Unused ports.** The *Port status up/down* rule fires for every port that is down. Ports with no cable and VLAN interfaces I don't route are down all the time, so I marked them as **Ignore** in `Device → Edit → Ports`. LibreNMS keeps polling them, it just stops alerting.
 
 | Device | Ignored ports |
 |---|---|
 | Fortigate 40f | `lan1`, `a`, `lan`, `fortilink` |
-| Switch Cisco | `gi4` to `gi8`, VLAN interfaces `10`, `20`, `30`, `99`, `999` |
+| Switch Cisco | `gi4` to `gi8`, and VLAN interfaces `10`, `20`, `30`, `99`, `999` |
 
-![Ignored ports, FortiGate](./images/port-ignore-fortigate.png)
-![Ignored ports, Cisco](./images/port-ignore-cisco.png)
+![Ignored ports on the FortiGate](./images/port-ignore-fortigate.png)
+![Ignored ports on the Cisco switch](./images/port-ignore-cisco.png)
 
-**6.2 FortiGate license sensors.** FortiOS exposes one *Days left for ...* sensor per subscription service (30 in total). Without an active Fortinet contract they sit at `-295` days and keep *Sensor under limit* firing. Alerts are switched **OFF** for each of them in `Device → Edit → Health`.
+**License sensors.** FortiOS reports one *Days left for ...* sensor per subscription (30 of them). I don't have an active Fortinet contract, so they are all at `-295` days, and the *Sensor under limit* rule kept firing for them. I turned **Alerts** off for each of those sensors in `Device → Edit → Health`.
 
-![License sensors with alerts disabled](./images/health-license-sensors.png)
+![License sensors with alerts turned off](./images/health-license-sensors.png)
 
 ---
 
-## 7. Telegram alerting
+## 6. Set up Telegram alerts
 
-> **Why:** push notifications reach the phone immediately. The operation is defined once and reused by every rule, and the template keeps each message short enough to read at a glance.
+In LibreNMS an alert goes through four pieces. A **rule** decides when something is wrong. An **operation** decides who gets notified and when. A **transport** is the channel (Telegram here). A **template** is the text of the message. A rule with no operation raises the alert but sends nothing.
 
-**7.1 Bot and chat ID**
+### Create the bot
 
-1. In Telegram, talk to `@BotFather`, send `/newbot` and keep the token.
-2. Send `/start` to the new bot.
-3. Read the chat ID from `https://api.telegram.org/bot<BOT_TOKEN>/getUpdates` (`"chat":{"id":...}`).
+1. In Telegram, talk to `@BotFather`, send `/newbot` and follow the questions. Keep the token it gives you.
+2. Send `/start` to your new bot, so it is allowed to write to you.
+3. Get your chat ID by opening `https://api.telegram.org/bot<BOT_TOKEN>/getUpdates` in a browser. It's the `id` inside `"chat"`.
 
 ![BotFather](./images/botfather.png)
 
-**7.2 Alert transport.** `Alerts → Alert Transports → Create alert transport`
+### Create the transport
+
+`Alerts → Alert Transports → Create alert transport`:
 
 | Field | Value |
 |---|---|
 | Transport name | `Bot` |
 | Transport type | Telegram |
 | Default Alert | ON |
-| Chat ID | `<CHAT_ID>` |
+| Chat ID | your chat ID |
 | Thread ID | empty |
-| Token | `********` |
+| Token | your bot token |
 | Format | HTML |
 | Send PNG Graph as | photo |
 
 ![Telegram transport](./images/telegram-transport.png)
 
-Use the *Test transport* button to confirm delivery.
+Press the check button (*Test transport*) to send a test message:
 
 ![Test transport button](./images/transport-test-button.png)
-![Test alert in Telegram](./images/telegram-test-alert.png)
+![Test message in Telegram](./images/telegram-test-alert.png)
 
-**7.3 Alert operation.** `Alerts → Alert Operations → Create operation`. A rule without an operation raises the alert but sends nothing.
+### Create the operation
 
-| Field | Value |
-|---|---|
-| Name | `Send to telegram` |
-| Default step duration | `300` s |
-| Suppress notifications | OFF |
-| Segment | steps `1` to `1`, start `1` s, step duration `300` s |
-| Transports / groups | `Telegram: Bot` |
+`Alerts → Alert Operations → Create operation`. Mine is called `Send to telegram`, with a default step duration of `300`, one segment (steps `1` to `1`, start `1` s, step duration `300` s) and the `Telegram: Bot` transport.
 
 ![Alert operation](./images/alert-operation.png)
 
-**7.4 Alert rules.** Each rule is linked to the operation through its **Operation** field.
+### Link the rules
 
-![Operation selected in a rule](./images/alert-rule-operation.png)
+Open each rule in `Alerts → Alert Rules` and pick the operation in its **Operation** field.
 
-| Rule | Condition | Severity |
-|---|---|---|
-| CPU usage above 90% | `macros.device_up = 1 AND processors.processor_usage >= 90` | Warning |
-| RAM usage above 90% | `macros.device_up = 1 AND mempools.mempool_perc >= 90` | Warning |
-| Storage usage above 80% | `storage.storage_perc >= 80` | Warning |
-| Device Down (SNMP unreachable) | `macros.device_down = 1 AND devices.status_reason LIKE '%snmp%'` | Critical |
-| Device Down! Due to no ICMP response. | `macros.device_down = 1 AND devices.status_reason LIKE '%icmp%'` | Critical |
-| Device rebooted | `devices.uptime < 300 AND macros.device = 1` | Critical |
-| Ping Latency | `device_stats.ping_rtt_last > 60` | Critical |
-| Port status up/down | `macros.port_down = 1` | Critical |
-| Port utilisation over threshold | `macros.port_usage_perc >= 80 AND macros.port_up = 1` | Critical |
-| Sensor over limit | `sensors.sensor_current > sensors.sensor_limit AND sensors.sensor_alert = 1 AND macros.device_up = 1` | Critical |
-| Sensor under limit | `sensors.sensor_current < sensors.sensor_limit_low AND sensors.sensor_alert = 1 AND macros.device_up = 1` | Critical |
-| Service up/down | `services.service_status != 0 AND macros.device_up = 1` | Critical |
-| State Sensor Critical | `macros.state_sensor_critical = 1 AND sensors.sensor_alert = 1` | Critical |
-| Wireless Sensor over limit | `wireless_sensors.sensor_current >= wireless_sensors.sensor_limit AND wireless_sensors.sensor_alert = 1 AND macros.device_up = 1` | Critical |
-| Wireless Sensor under limit | `wireless_sensors.sensor_current <= wireless_sensors.sensor_limit_low AND wireless_sensors.sensor_alert = 1 AND sensors.group != "License expiration"` | Critical |
+![Choosing the operation in a rule](./images/alert-rule-operation.png)
+
+These are the rules I have enabled:
+
+| Rule | Fires when |
+|---|---|
+| CPU usage above 90% | CPU usage is 90% or more |
+| RAM usage above 90% | RAM usage is 90% or more |
+| Storage usage above 80% | disk usage is 80% or more |
+| Device Down (SNMP unreachable) | the device doesn't answer SNMP |
+| Device Down! Due to no ICMP response. | the device doesn't answer ping |
+| Device rebooted | uptime is below 300 s |
+| Ping Latency | ping latency is above 60 ms |
+| Port status up/down | a port is down |
+| Port utilisation over threshold | a port is at 80% or more of its speed |
+| Sensor over limit / Sensor under limit | a sensor goes above its high limit or below its low limit |
+| Service up/down | a monitored service is down |
+| State Sensor Critical | a state sensor reports critical |
+| Wireless Sensor over limit / under limit | the same, for wireless sensors |
 
 ![Alert rules list](./images/alert-rules-list.png)
 
-**7.5 Minimalist template.** The default message is verbose and prints raw SNMP fields (`sysObjectID`, `snmpEngineID`, ...).
+One thing that tripped me up: on threshold rules (CPU, RAM, storage) choose **greater or equal**, not **equal**. With *equal* the rule only fires when the value is exactly 90, so it never fires in practice.
 
-![Default alert in Telegram](./images/telegram-default.png)
+### Replace the message template
 
-Replace it in `Alerts → Alert Templates → Default Alert Template`. The template prints the state, rule name, host, time, and one line per faulty port, sensor, disk, RAM or CPU entry. Port lines show `down` in an `ALERT` and `up` in a `RESOLVED` message (the template checks `$alert->state`).
+The default alert message is long and prints raw SNMP fields (`sysObjectID`, `snmpEngineID` and so on):
 
-![Alert template editor](./images/alert-template-editor.png)
+![Default alert message](./images/telegram-default.png)
 
-<details>
-<summary>Alert template (Blade, HTML format)</summary>
+I replaced it in `Alerts → Alert Templates → Default Alert Template` with a short one. It shows the state, rule name, host and time, plus one line for each port, sensor, disk, RAM or CPU that caused the alert:
 
 ```html
 @if ($alert->state == 0)
@@ -353,19 +323,19 @@ Replace it in `Alerts → Alert Templates → Default Alert Template`. The templ
 @elseif ($alert->state == 2)
 🟡 <b>ACK: {{ $alert->name }}</b>
 @endif
-<b>Host:</b> {{ $alert->display }} (<code>{{$alert->hostname }}</code>)
-<b>Time:</b> {{ $alert->timestamp }} ({{$alert->elapsed }})
+<b>Host:</b> {{ $alert->display }} (<code>{{ $alert->hostname }}</code>)
+<b>Time:</b> {{ $alert->timestamp }} ({{ $alert->elapsed }})
 @if ($alert->faults)
 
-@foreach ($alert->faults as $key =>$value)
+@foreach ($alert->faults as $key => $value)
 @if ($value['ifDescr'])
-• <b>Port:</b> <code>{{ $value['ifDescr'] }}</code> @if ($value['ifAlias'] && $value['ifAlias'] !=$value['ifDescr'])({{ $value['ifAlias'] }})@endif — {{ $alert->state == 0 ? 'up' : $value['ifOperStatus'] }}
+• <b>Port:</b> <code>{{ $value['ifDescr'] }}</code> @if ($value['ifAlias'] && $value['ifAlias'] != $value['ifDescr'])({{ $value['ifAlias'] }})@endif — {{ $alert->state == 0 ? 'up' : $value['ifOperStatus'] }}
 @elseif ($value['sensor_descr'])
-• <b>Sensor:</b> {{ $value['sensor_descr'] }} (<code>{{$value['sensor_current'] }}</code>)
+• <b>Sensor:</b> {{ $value['sensor_descr'] }} (<code>{{ $value['sensor_current'] }}</code>)
 @elseif ($value['storage_descr'])
-• <b>Disk:</b> {{ $value['storage_descr'] }} (<code>{{$value['storage_perc'] }}%</code>)
+• <b>Disk:</b> {{ $value['storage_descr'] }} (<code>{{ $value['storage_perc'] }}%</code>)
 @elseif ($value['mempool_descr'])
-• <b>RAM:</b> {{ $value['mempool_descr'] }} (<code>{{$value['mempool_perc'] }}%</code>)
+• <b>RAM:</b> {{ $value['mempool_descr'] }} (<code>{{ $value['mempool_perc'] }}%</code>)
 @elseif ($value['processor_descr'])
 • <b>CPU:</b> <code>{{ $value['processor_usage'] }}%</code>
 @endif
@@ -373,108 +343,77 @@ Replace it in `Alerts → Alert Templates → Default Alert Template`. The templ
 @endif
 ```
 
-</details>
+The part at the end of the `Port` line is there because with a plain `{{ $value['ifOperStatus'] }}` the recovery message still said `down` next to the port. Now it prints `up` when the alert is resolved (state 0) and the real status otherwise.
 
-Result in Telegram:
+![Template editor](./images/alert-template-editor.png)
 
-![Minimalist alert in Telegram](./images/telegram-minimal.png)
+This is what an alert looks like with it:
 
-**7.6 End-to-end test: unplug an LACP member link.** To validate the whole chain (polling, rule, operation, transport and template), one member link of the FortiGate–SG300 LACP bundle was unplugged on purpose and then plugged back in. The two ends of that link are FortiGate `lan2` and Cisco `gigabitethernet9`. The test was run twice: the Faults page capture comes from the first run (13:05), and the Telegram captures from the second run, after the final template was applied.
-
-| Step | Observed |
-|---|---|
-| Link unplugged | `Port status up/down` raised on both devices: `Fortigate 40f` / `lan2` at 21:20:06 and `Switch Cisco` / `gigabitethernet9` at 21:20:08 |
-| LibreNMS | Both faults listed on the Faults page |
-| Telegram | One `ALERT` message per device, each naming the port as `down` |
-| Link restored | One `RESOLVED` message per device at 21:25:06 and 21:25:09, with alert durations of 5m and 5m 1s, each naming the port as `up` |
-
-![Faults page during the first run](./images/lacp-test-faults.png)
-![ALERT messages in Telegram](./images/lacp-test-alert.png)
-![RESOLVED messages in Telegram](./images/lacp-test-resolved.png)
-
-Notes:
-
-- Port state is detected on the polling cycle (5 minutes by default), so expect up to that delay between unplugging a cable and the alert.
-- `ALERT` messages print the port as `down`; `RESOLVED` messages print the recovered port as `up`.
+![Alert with the new template](./images/telegram-minimal.png)
 
 ---
 
-## 8. Dashboard
+## 7. Test the alerts
 
-> **Why:** one screen answers "is everything up, and is anything busy or alerting?"
+The easy way to know it all works is to break something. I unplugged one cable of the LACP link between the FortiGate and the switch (`lan2` on the FortiGate, `gigabitethernet9` on the switch), waited, and plugged it back in.
 
-A single dashboard, **Homelab NOC**, built from LibreNMS widgets: `Overview → Dashboards → +`, then *Edit* to add widgets.
+LibreNMS only notices on its next polling cycle (every 5 minutes by default), so give it a few minutes. The ports show up on the Faults page (this capture is from an earlier run of the same test):
 
-| Widget | Content |
-|---|---|
-| Availability Map | Up / warning / down state of the four devices |
-| Alerts | Active alerts (empty when healthy) |
-| Graph: *WAN interface* | FortiGate `wan` port (1 Gbps) |
-| Graph: *LACP FORTIGATE (LAN)* | FortiGate LACP trunk (2 Gbps) |
-| Top Devices | CPU load per device |
-| Top Interfaces | Busiest interfaces in the last 15 minutes |
-| Device Summary Horizontal | Device, port and health totals |
+![Faults page](./images/lacp-test-faults.png)
 
-![Dashboard, summary widgets](./images/dashboard-summary.png)
+And the alerts arrive in Telegram, one per device. In my run they came at 21:20:
 
----
+![Alerts in Telegram](./images/lacp-test-alert.png)
 
-## 9. Result
+Plug the cable back in and, after the next poll, you get the recovery messages (21:25 in my run):
 
-| Item | Status |
-|---|---|
-| Devices | 4 total, 4 up, 0 down |
-| Ports | 69 total, 45 up, 14 ignored |
-| Health sensors | 82 total, 30 with alerts disabled (FortiGate license counters) |
-| Active alerts | none |
-| End-to-end alert test | LACP member link unplugged and restored: `ALERT` then `RESOLVED` in Telegram for both devices ([section 7.6](#7-telegram-alerting)) |
-| SNMP on the wire | Port mirror and Wireshark: requests and `noError` responses between LibreNMS and the three LAN devices ([section 5.4](#5-adding-network-devices)) |
+![Recovery messages in Telegram](./images/lacp-test-resolved.png)
 
-CPU polling per device (`Health → Processor`) and the switch overview confirm that data is being collected:
-
-![Processor health](./images/health-processors.png)
-![Switch overview](./images/switch-overview.png)
-
----
-
-## 10. Testing and troubleshooting
-
-A physical test (unplugging an LACP member link) is documented in [section 7.6](#7-telegram-alerting). Software-side checks, run from `/opt/librenms` on the LXC:
+If you don't want to touch cables, you can also run these from `/opt/librenms` in the container:
 
 ```bash
-# Is the installation healthy?
+# Check the installation
 ./validate.php
 
-# Force a real alert through the transport
+# Send a real alert through the transport
 ./scripts/test-alert.php -r <rule_id> -h <hostname_or_device_id> -d
 
-# Render a template against a device and a rule
+# Show how a template renders for a device and a rule
 ./scripts/test-template.php -t <template_id> -d -h <hostname> -r <rule_id>
 ```
 
-`test-template.php` renders the alert case only. To check a `RESOLVED` message, restore a real fault as in [section 7.6](#7-telegram-alerting).
+`test-template.php` only shows the alert message, not the recovery one. For that you need a real fault, like the cable.
 
-| Symptom | Check |
+If an alert shows up in LibreNMS but nothing reaches Telegram, check that the rule has an operation, and press *Test transport* again.
+
+---
+
+## 8. Build a dashboard
+
+I wanted one page that shows everything at a glance. On the Overview page, use the **+** next to the dashboard selector to create one (mine is called *Homelab NOC*), then *Edit* to add widgets:
+
+| Widget | What it shows |
 |---|---|
-| Device shows *warning* right after a reboot | `uptime_warning` threshold ([section 3](#3-librenms-installation-and-initial-setup)) |
-| Device added but no SNMP data | `snmpwalk -v2c -c <COMMUNITY> <device-ip> sysDescr` from the LXC. Verify the community, the allowed host `192.168.10.111`, and (FortiGate) SNMP on the interface |
-| Alert appears in LibreNMS but nothing reaches Telegram | The rule has no operation assigned, or *Test transport* fails |
-| Threshold rule (CPU, RAM, storage) never fires | The operator must be `greater or equal`. `equal` only matches the exact value |
-| Permanent alerts for ports or sensors that are down by design | [Noise reduction](#6-noise-reduction) |
+| Availability Map | which devices are up, warning or down |
+| Alerts | active alerts (empty when all is fine) |
+| Graph: *WAN interface* | traffic on the FortiGate `wan` port (1 Gbps) |
+| Graph: *LACP FORTIGATE (LAN)* | traffic on the FortiGate LACP link (2 Gbps) |
+| Top Devices | CPU load per device |
+| Top Interfaces | the busiest interfaces in the last 15 minutes |
+| Device Summary Horizontal | totals of devices, ports and sensors |
 
-References: [alerting tests](https://docs.librenms.org/Alerting/Testing/), [FAQ](https://docs.librenms.org/Support/FAQ), [alert operations](https://docs.librenms.org/Alerting/Operations/).
+![Dashboard summary widgets](./images/dashboard-summary.png)
 
-## 11. Security notes
+Two more pages are useful to check that data is coming in: `Health → Processor` for CPU on every device, and the overview page of each device.
 
-- Use read-only communities and restrict them to the LibreNMS IP (`rocommunity <COMMUNITY> 192.168.10.111`, allowed host on the FortiGate and the SG300).
-- Do not keep default strings (`public`, `private`). The wireless AP also exposes a read-write community: leave it unset or non-default.
-- SNMP v2c sends the community in clear text (the capture in [section 5.4](#5-adding-network-devices) shows it). Keep UDP/161 inside the LAN. SNMPv3 is the upgrade path.
-- Mask communities, bot tokens and chat IDs in screenshots (`********`).
+![CPU per device](./images/health-processors.png)
+![Overview of the switch](./images/switch-overview.png)
 
-## Repository layout
+---
 
-```text
-.
-├── README.md
-└── images/      # screenshots referenced above
-```
+## Security notes
+
+- Use read-only communities and limit them to the LibreNMS IP (the IP at the end of `rocommunity`, and the allowed host on the FortiGate and the SG300).
+- Don't leave the default strings (`public`, `private`). My access point also has a read-write community field: leave it empty or change it.
+- SNMP v2c sends the community in clear text, as the capture in step 4 shows. Keep UDP 161 inside your LAN. SNMPv3 is the safer option if you can use it.
+- Hide communities, bot tokens and chat IDs before you share screenshots.
